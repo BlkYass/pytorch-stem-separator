@@ -231,5 +231,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     print(f"Flask debug server running → http://127.0.0.1:{port}")
     print("Debug mode enabled. All errors will show in the terminal.\n")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=False)
 
