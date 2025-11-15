@@ -1,0 +1,246 @@
+import os
+import uuid
+import shutil
+import subprocess
+from pathlib import Path
+
+from flask import Flask, request, render_template_string, send_from_directory, redirect, url_for, flash
+
+# ------------------------------------------------------------------
+# Basic config
+# ------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "uploads"
+RESULTS_DIR = BASE_DIR / "results"
+
+UPLOAD_DIR.mkdir(exist_ok=True)
+RESULTS_DIR.mkdir(exist_ok=True)
+
+# This model + flags are what you confirmed working:
+# demucs --two-stems=vocals -n htdemucs_ft --shifts 0 --overlap 0.05 --jobs 1 --mp3 <file>
+MODEL_NAME = "htdemucs_ft"
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")  # needed for flash()
+
+
+# ------------------------------------------------------------------
+# HTML template (very simple, single page)
+# ------------------------------------------------------------------
+TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Vocal Separator (Demucs)</title>
+  <style>
+    body { font-family: sans-serif; max-width: 800px; margin: 2rem auto; }
+    .box { border: 1px solid #ddd; padding: 1rem 1.5rem; border-radius: 8px; }
+    .error { color: #c00; }
+    audio { width: 100%; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>🎤 Vocal Separator (Demucs)</h1>
+  <div class="box">
+    <p>Upload a song (MP3/WAV/M4A). The app uses <b>Demucs {{ model_name }}</b> to produce:</p>
+    <ul>
+      <li><b>Vocals</b> (voice only)</li>
+      <li><b>Instrumental</b> (music only)</li>
+    </ul>
+    <form method="post" action="{{ url_for('separate') }}" enctype="multipart/form-data">
+      <p>
+        <input type="file" name="file" accept="audio/*" required>
+      </p>
+      <p>
+        <button type="submit">Separate Vocals & Instrumental</button>
+      </p>
+    </form>
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <ul class="error">
+          {% for m in messages %}
+            <li>{{ m }}</li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+    {% endwith %}
+  </div>
+
+  {% if vocals_url or instrumental_url %}
+    <h2>Results</h2>
+    <div class="box">
+      {% if vocals_url %}
+        <h3>Vocals</h3>
+        <audio controls src="{{ vocals_url }}"></audio>
+        <p><a href="{{ vocals_url }}" download>Download vocals</a></p>
+      {% endif %}
+      {% if instrumental_url %}
+        <h3>Instrumental</h3>
+        <audio controls src="{{ instrumental_url }}"></audio>
+        <p><a href="{{ instrumental_url }}" download>Download instrumental</a></p>
+      {% endif %}
+      {% if folder_url %}
+        <p>Folder: <a href="{{ folder_url }}" target="_blank">{{ folder_url }}</a> (may show index or prompt download)</p>
+      {% endif %}
+    </div>
+  {% endif %}
+</body>
+</html>
+"""
+
+
+# ------------------------------------------------------------------
+# Helper: run demucs on an audio file, return paths to stems
+# ------------------------------------------------------------------
+def run_demucs_two_stems(input_path: Path) -> tuple[Path, Path, Path]:
+    """
+    Runs Demucs in 2-stem mode (vocals + no_vocals) on input_path.
+    Returns (vocals_path, instrumental_path, result_folder).
+    """
+
+    # Each job gets its own result subdir
+    job_id = uuid.uuid4().hex
+    job_dir = RESULTS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    # Demucs writes to an "out root" with model + song subfolders
+    out_root = job_dir / "raw"
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "demucs",
+        "--two-stems", "vocals",
+        "-n", MODEL_NAME,
+        "--shifts", "0",
+        "--overlap", "0.05",
+        "--jobs", "1",
+        "--mp3",
+        "--out", str(out_root),
+        str(input_path),
+    ]
+
+    # Actually run Demucs
+    completed = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"Demucs failed:\n{completed.stdout}")
+
+    # Locate Demucs output folder: out_root/<model>/<basename>/
+    base = input_path.stem
+    model_dir = out_root / MODEL_NAME / base
+    if not model_dir.is_dir():
+        # Fallback: search for a folder named like the audio base
+        found = None
+        for root, dirs, _ in os.walk(out_root):
+            for d in dirs:
+                if d == base:
+                    found = Path(root) / d
+                    break
+            if found:
+                break
+        if not found:
+            raise RuntimeError("Could not locate Demucs output folder.")
+        model_dir = found
+
+    vocals = None
+    instrumental = None
+    for fn in os.listdir(model_dir):
+        low = fn.lower()
+        full = model_dir / fn
+        if not full.is_file():
+            continue
+        if "vocals" in low and not low.startswith("no_"):
+            vocals = full
+        if "no_vocals" in low or "accompaniment" in low or "other" in low:
+            instrumental = full
+
+    if not vocals or not instrumental:
+        raise RuntimeError("Could not find both vocals and instrumental in Demucs output.")
+
+    # Copy to job_dir root with nice names
+    vocals_out = job_dir / f"{base}_vocals{vocals.suffix}"
+    inst_out = job_dir / f"{base}_instrumental{instrumental.suffix}"
+    shutil.copy2(vocals, vocals_out)
+    shutil.copy2(instrumental, inst_out)
+
+    return vocals_out, inst_out, job_dir
+
+
+# ------------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------------
+@app.get("/")
+def index():
+    return render_template_string(
+        TEMPLATE,
+        model_name=MODEL_NAME,
+        vocals_url=None,
+        instrumental_url=None,
+        folder_url=None,
+    )
+
+
+@app.post("/separate")
+def separate():
+    file = request.files.get("file")
+    if not file:
+        flash("No file uploaded.")
+        return redirect(url_for("index"))
+
+    # Save upload to uploads/
+    filename = file.filename or ""
+    if not filename:
+        flash("Invalid filename.")
+        return redirect(url_for("index"))
+
+    ext = Path(filename).suffix or ".mp3"
+    upload_name = f"{uuid.uuid4().hex}{ext}"
+    upload_path = UPLOAD_DIR / upload_name
+    file.save(upload_path)
+
+    try:
+        vocals, inst, job_dir = run_demucs_two_stems(upload_path)
+    except Exception as e:
+        flash(str(e))
+        return redirect(url_for("index"))
+
+    # Build URLs for the browser
+    vocals_rel = vocals.relative_to(RESULTS_DIR)
+    inst_rel = inst.relative_to(RESULTS_DIR)
+
+    vocals_url = url_for("serve_result_file", path=str(vocals_rel))
+    inst_url = url_for("serve_result_file", path=str(inst_rel))
+
+    # Optional folder URL (may or may not show an index depending on host)
+    folder_url = url_for("serve_result_file", path=str(vocals_rel.parent))
+
+    return render_template_string(
+        TEMPLATE,
+        model_name=MODEL_NAME,
+        vocals_url=vocals_url,
+        instrumental_url=inst_url,
+        folder_url=folder_url,
+    )
+
+
+@app.route("/results/<path:path>")
+def serve_result_file(path: str):
+    """
+    Serve files from the results/ directory.
+    """
+    return send_from_directory(RESULTS_DIR, path, as_attachment=False)
+
+
+# ------------------------------------------------------------------
+# Entry point
+# ------------------------------------------------------------------
+if __name__ == "__main__":
+    # Local dev
+    port = int(os.environ.get("PORT", 7860))
+    app.run(host="0.0.0.0", port=port, debug=True)
+

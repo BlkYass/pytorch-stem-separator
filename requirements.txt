@@ -1,0 +1,8 @@
+Flask==3.0.0
+Flask-Cors==4.0.0
+
+demucs==4.0.1
+torch>=2.2,<3.0
+torchaudio>=2.2,<3.0
+torchcodec==0.4.0
+
